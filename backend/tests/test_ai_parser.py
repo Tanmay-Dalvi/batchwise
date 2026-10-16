@@ -1,0 +1,386 @@
+"""Tests for AI note parsing, ambiguity detection, and failure resilience with mocked Ollama."""
+
+import json
+from unittest.mock import AsyncMock, patch
+import httpx
+import pytest
+from fastapi import status
+
+from app.ai.parser import (
+    _clean_number_string,
+    _extract_json_payload,
+    parse_costing_note,
+)
+from app.ai.schemas import ParseNoteResponse
+
+
+# --- Helper unit tests ---
+
+def test_clean_number_string_variations():
+    """Verify currency cleaning and number extraction."""
+    assert _clean_number_string("600 rupees") == "600"
+    assert _clean_number_string("₹180.50") == "180.50"
+    assert _clean_number_string("Rs. 80") == "80"
+    assert _clean_number_string("Rs 25 each") == "25"
+    assert _clean_number_string("5 kg") == "5"
+    assert _clean_number_string(None) is None
+    assert _clean_number_string("no numbers here") is None
+
+
+def test_extract_json_payload_markdown_blocks():
+    """Verify JSON extraction from markdown code fences and noisy LLM responses."""
+    raw_markdown = "```json\n{\"batch_name\": \"Besan Sev\", \"ingredients\": []}\n```"
+    data = _extract_json_payload(raw_markdown)
+    assert data is not None
+    assert data["batch_name"] == "Besan Sev"
+
+    noisy_text = "Here is the extracted data:\n{\"packaging_cost\": \"80\"}\nHope this helps!"
+    data2 = _extract_json_payload(noisy_text)
+    assert data2 is not None
+    assert data2["packaging_cost"] == "80"
+
+    assert _extract_json_payload("") is None
+    assert _extract_json_payload("not json at all") is None
+
+
+# --- Note Parsing Tests with Mocked Ollama ---
+
+@pytest.mark.anyio
+async def test_parse_note_example_a_canonical():
+    """
+    Test Note A:
+    '5 kg besan cost 600 rupees, oil 180, packaging 80, made 75 packets, selling price 25 each.'
+    """
+    mock_llm_json = {
+        "batch_name": "Besan Batch",
+        "ingredients": [
+            {"name": "besan", "recipe_quantity": "5", "recipe_unit": "kg", "purchase_price": "600", "is_ambiguous": False},
+            {"name": "oil", "recipe_quantity": None, "recipe_unit": None, "purchase_price": "180", "is_ambiguous": True, "ambiguity_reason": "Price ₹180 extracted, but quantity and unit are not specified"},
+        ],
+        "packaging_cost": "80",
+        "sellable_quantity": "75",
+        "yield_unit_name": "packets",
+        "planned_selling_price": "25",
+    }
+
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"response": json.dumps(mock_llm_json)},
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        result = await parse_costing_note(
+            "5 kg besan cost 600 rupees, oil 180, packaging 80, made 75 packets, selling price 25 each."
+        )
+
+    assert result.success is True
+    assert result.status == "partial"  # Partial because oil quantity is missing/ambiguous
+    candidate = result.candidate
+    assert candidate is not None
+    assert candidate.batch_name == "Besan Batch"
+    assert len(candidate.ingredients) == 2
+
+    # Besan is fully resolved
+    besan = next(i for i in candidate.ingredients if i.name == "besan")
+    assert besan.recipe_quantity == "5"
+    assert besan.recipe_unit == "kg"
+    assert besan.purchase_price == "600"
+    assert besan.is_ambiguous is False
+
+    # Oil is flagged ambiguous (missing quantity)
+    oil = next(i for i in candidate.ingredients if i.name == "oil")
+    assert oil.purchase_price == "180"
+    assert oil.is_ambiguous is True
+
+    assert candidate.packaging_cost == "80"
+    assert candidate.sellable_quantity == "75"
+    assert candidate.yield_unit_name == "packets"
+    assert candidate.planned_selling_price == "25"
+    assert len(candidate.ambiguities) >= 1
+    assert candidate.can_calculate is False  # Cannot calculate until oil quantity is clarified
+
+
+@pytest.mark.anyio
+async def test_parse_note_example_b_missing_quantities():
+    """
+    Test Note B:
+    'Besan 600, oil 180, 75 packets.'
+    Missing quantities for both besan and oil.
+    """
+    mock_llm_json = {
+        "batch_name": "Besan Batch",
+        "ingredients": [
+            {"name": "besan", "recipe_quantity": None, "recipe_unit": None, "purchase_price": "600", "is_ambiguous": True},
+            {"name": "oil", "recipe_quantity": None, "recipe_unit": None, "purchase_price": "180", "is_ambiguous": True},
+        ],
+        "sellable_quantity": "75",
+        "yield_unit_name": "packets",
+    }
+
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"response": json.dumps(mock_llm_json)},
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note("Besan 600, oil 180, 75 packets.")
+
+    assert result.success is True
+    assert result.status == "partial"
+    candidate = result.candidate
+    assert candidate.sellable_quantity == "75"
+    assert len(candidate.ambiguities) >= 2  # Ambiguities for besan and oil quantities
+    assert candidate.can_calculate is False
+
+
+@pytest.mark.anyio
+async def test_parse_note_example_c_single_ambiguous_item():
+    """
+    Test Note C:
+    'Oil 180.'
+    Does 180 mean price ₹180 or quantity 180 ml? Requires clarification.
+    """
+    mock_llm_json = {
+        "batch_name": None,
+        "ingredients": [
+            {"name": "oil", "recipe_quantity": None, "recipe_unit": None, "purchase_price": None, "is_ambiguous": True, "ambiguity_reason": "180 could be ₹180 price or 180 ml volume"}
+        ],
+        "sellable_quantity": None,
+    }
+
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"response": json.dumps(mock_llm_json)},
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note("Oil 180.")
+
+    assert result.success is True
+    assert result.status == "partial"
+    candidate = result.candidate
+    assert len(candidate.ingredients) == 1
+    assert candidate.ingredients[0].is_ambiguous is True
+    assert "sellable_quantity" in candidate.missing_fields
+    assert candidate.can_calculate is False
+
+
+@pytest.mark.anyio
+async def test_parse_note_example_d_yield_and_sales_only():
+    """
+    Test Note D:
+    'Made 75 packets. Sold each for 25.'
+    No ingredients or expenses entered.
+    """
+    mock_llm_json = {
+        "batch_name": None,
+        "ingredients": [],
+        "sellable_quantity": "75",
+        "yield_unit_name": "packets",
+        "planned_selling_price": "25",
+    }
+
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"response": json.dumps(mock_llm_json)},
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note("Made 75 packets. Sold each for 25.")
+
+    assert result.success is True
+    assert result.status == "partial"
+    candidate = result.candidate
+    assert candidate.sellable_quantity == "75"
+    assert candidate.planned_selling_price == "25"
+    assert "ingredients" in candidate.missing_fields
+    assert candidate.can_calculate is False
+
+
+@pytest.mark.anyio
+async def test_parse_note_empty_input():
+    """Empty note input returns structured error without contacting model."""
+    result = await parse_costing_note("   ")
+    assert result.success is False
+    assert result.status == "error"
+    assert "Empty note provided" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_ollama_unavailable():
+    """Ollama connection refusal returns clean error indicating manual costing is available."""
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = httpx.ConnectError("Connection refused")
+        result = await parse_costing_note("5 kg flour for 200")
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "Local Ollama service is not reachable" in result.error_message
+    assert "Manual batch costing remains fully available" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_ollama_timeout():
+    """Ollama timeout returns clean error without crashing."""
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = httpx.TimeoutException("Read timed out")
+        result = await parse_costing_note("5 kg flour for 200")
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "timed out" in result.error_message
+    assert "Manual recipe and batch costing is ready" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_malformed_model_json():
+    """Malformed non-JSON output from LLM is handled safely."""
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"response": "I cannot parse this into JSON."},
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note("flour 500")
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "malformed output" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_ollama_http_500():
+    """Ollama internal server error returns clean error status."""
+    mock_resp = httpx.Response(
+        status_code=500,
+        text="Internal Server Error in llama.cpp runner",
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note("flour 500")
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "HTTP error 500" in result.error_message
+
+
+# --- API Endpoint Test ---
+
+def test_api_parse_note_endpoint(client):
+    """POST /api/v1/parse-note endpoint staging verification."""
+    mock_llm_json = {
+        "batch_name": "Rava Ladoo",
+        "ingredients": [
+            {"name": "rava", "recipe_quantity": "1", "recipe_unit": "kg", "purchase_price": "60", "is_ambiguous": False}
+        ],
+        "sellable_quantity": "40",
+        "yield_unit_name": "pieces",
+        "planned_selling_price": "10",
+    }
+
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"response": json.dumps(mock_llm_json)},
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        # 1. Parse note
+        resp = client.post("/api/v1/parse-note", json={"note": "1 kg rava 60 rs, made 40 pieces, sold for 10"})
+        assert resp.status_code == status.HTTP_200_OK
+        data = resp.json()
+        assert data["success"] is True
+        assert data["candidate"]["batch_name"] == "Rava Ladoo"
+        assert data["candidate"]["sellable_quantity"] == "40"
+        assert data["candidate"]["can_calculate"] is True
+
+        # 2. Verify NO database records were created by parsing
+        recipes_resp = client.get("/api/v1/recipes")
+        assert len(recipes_resp.json()) == 0
+        batches_resp = client.get("/api/v1/batches")
+        assert len(batches_resp.json()) == 0
+
+
+def test_post_process_quantity_without_price():
+    """Ingredient with quantity but missing purchase price flags ambiguity."""
+    from app.ai.parser import _post_process_candidate
+
+    raw_dict = {
+        "ingredients": [
+            {"name": "Sugar", "recipe_quantity": "5", "recipe_unit": "kg", "purchase_price": None}
+        ]
+    }
+    cand = _post_process_candidate(raw_dict, "5 kg sugar")
+    assert cand.ingredients[0].is_ambiguous is True
+    assert "Sugar_price" in cand.missing_fields
+    assert cand.can_calculate is False
+
+
+def test_post_process_unrecognized_unit():
+    """Unrecognized unit flags ambiguity on the ingredient."""
+    from app.ai.parser import _post_process_candidate
+
+    raw_dict = {
+        "ingredients": [
+            {"name": "Flour", "recipe_quantity": "3", "recipe_unit": "buckets", "purchase_price": "150"}
+        ]
+    }
+    cand = _post_process_candidate(raw_dict, "3 buckets flour for 150")
+    assert cand.ingredients[0].is_ambiguous is True
+    assert "Unrecognized unit 'buckets'" in cand.ingredients[0].ambiguity_reason
+
+
+def test_post_process_empty_or_malformed_ingredient_entries():
+    """Non-dict or empty name items in ingredients list are ignored gracefully."""
+    from app.ai.parser import _post_process_candidate
+
+    raw_dict = {
+        "ingredients": [
+            "not a dict",
+            {"name": ""},
+            {"name": "Cardamom", "recipe_quantity": "50", "recipe_unit": "g", "purchase_price": "200"}
+        ]
+    }
+    cand = _post_process_candidate(raw_dict, "50g cardamom 200")
+    assert len(cand.ingredients) == 1
+    assert cand.ingredients[0].name == "Cardamom"
+
+
+@pytest.mark.anyio
+async def test_parse_note_corrupted_response_body():
+    """Ollama response body with unparsable JSON raises clean error."""
+    mock_resp = httpx.Response(
+        status_code=200,
+        content=b"invalid raw bytes not json",
+        request=httpx.Request("POST", "http://localhost:11434/api/generate"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note("flour 500")
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "unexpected non-JSON response payload" in result.error_message
+
+
+def test_clean_number_string_nan_edge():
+    """Single period or dot without digits returns None."""
+    assert _clean_number_string(".") is None
+    assert _clean_number_string("..") is None
+

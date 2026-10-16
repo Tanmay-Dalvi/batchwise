@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - BATCHWISE_DATABASE_URL=sqlite:////data/batchwise.db
+      - BATCHWISE_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+      - BATCHWISE_OLLAMA_URL=http://host.docker.internal:11434
+      - BATCHWISE_OLLAMA_MODEL=gemma3:1b
+    volumes:
+      - batchwise_data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  batchwise_data:
