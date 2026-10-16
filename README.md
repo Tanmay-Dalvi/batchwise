@@ -207,3 +207,4 @@ npm run build
 - **License:** MIT License
 - **Challenge:** Hacktoberfest 2026 Week 2 — “Side Hustle”
 - **Philosophy:** Transparent math, zero hallucinated figures, local-first privacy.
+
