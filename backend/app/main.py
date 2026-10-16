@@ -52,11 +52,27 @@ def create_application() -> FastAPI:
             },
         )
 
+    from fastapi import APIRouter
+    from app.api.v1.batches import router as batches_router
+    from app.api.v1.calculate import router as calculate_router
+    from app.api.v1.health import router as health_router
+    from app.api.v1.parse import router as parse_router
+    from app.api.v1.recipes import router as recipes_router
+
     # Register versioned API v1 routes
     app.include_router(api_v1_router)
 
-    # Root discovery endpoint
-    @app.get("/", tags=["root"])
+    # Register root compatibility routes (for clients connecting to host without /api/v1)
+    root_compat_router = APIRouter(include_in_schema=False)
+    root_compat_router.include_router(health_router)
+    root_compat_router.include_router(calculate_router)
+    root_compat_router.include_router(parse_router)
+    root_compat_router.include_router(recipes_router)
+    root_compat_router.include_router(batches_router)
+    app.include_router(root_compat_router)
+
+    # Root discovery endpoint (supports both GET and HEAD for container health checks)
+    @app.api_route("/", methods=["GET", "HEAD"], tags=["root"])
     def root():
         return {
             "app": settings.PROJECT_NAME,

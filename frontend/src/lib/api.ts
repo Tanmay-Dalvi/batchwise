@@ -12,8 +12,17 @@ import {
   RecipeUpdate,
 } from '../types/recipe';
 
-const rawBase = import.meta.env.VITE_API_BASE_URL || '/api/v1';
-const API_BASE = rawBase.replace(/\/+$/, '');
+function resolveApiBase(): string {
+  const rawBase = (import.meta.env.VITE_API_BASE_URL || '/api/v1').trim();
+  const stripped = rawBase.replace(/\/+$/, '');
+  // If user configured a bare origin (e.g. https://batchwise-ucyg.onrender.com), append /api/v1 automatically
+  if (stripped && !stripped.endsWith('/api/v1') && stripped !== '/api') {
+    return `${stripped}/api/v1`;
+  }
+  return stripped || '/api/v1';
+}
+
+const API_BASE = resolveApiBase();
 
 export class ApiError extends Error {
   public status: number;
