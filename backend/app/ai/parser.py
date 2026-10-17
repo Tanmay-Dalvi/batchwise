@@ -259,13 +259,13 @@ def _post_process_candidate(raw_dict: Dict[str, Any], raw_note: str) -> Candidat
     )
 
 
-async def _discover_available_gemini_model(
+async def _discover_available_gemini_models(
     api_key: str,
     client: httpx.AsyncClient,
-) -> Optional[str]:
+) -> List[str]:
     """
     Query Google Generative Language API ListModels endpoint to discover
-    an active, supported model for this API key if the default was retired or deprecated.
+    all active, supported models for this API key.
     """
     try:
         resp = await client.get(
@@ -274,7 +274,7 @@ async def _discover_available_gemini_model(
             headers={"x-goog-api-key": api_key},
         )
         if resp.status_code != 200:
-            return None
+            return []
         data = resp.json()
         models = data.get("models", [])
 
@@ -287,26 +287,9 @@ async def _discover_available_gemini_model(
                 if clean:
                     candidates.append(clean)
 
-        if not candidates:
-            return None
-
-        # Prioritize fast, free-tier friendly Flash models
-        flash_candidates = [c for c in candidates if "flash" in c.lower()]
-        for preferred in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"):
-            for fc in flash_candidates:
-                if fc == preferred:
-                    return fc
-        if flash_candidates:
-            return flash_candidates[0]
-
-        # Prioritize any Gemini model
-        gemini_candidates = [c for c in candidates if "gemini" in c.lower()]
-        if gemini_candidates:
-            return gemini_candidates[0]
-
-        return candidates[0]
+        return candidates
     except Exception:
-        return None
+        return []
 
 
 async def _call_gemini_api(
@@ -354,15 +337,29 @@ async def _call_gemini_api(
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
             resp = await client.post(url, headers=headers, params=params, json=payload)
 
-            # If 404 (e.g. deprecated model like gemini-1.5-flash), attempt automatic discovery
+            # If 404 (e.g. deprecated model like gemini-1.5-flash), attempt automatic fallback across active candidate models
             if resp.status_code == 404:
-                discovered_model = await _discover_available_gemini_model(api_key, client)
-                if discovered_model and discovered_model != clean_model:
-                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{discovered_model}:generateContent"
+                discovered_models = await _discover_available_gemini_models(api_key, client)
+                # Build prioritised candidate list, explicitly excluding clean_model that just failed
+                fallback_pool = (
+                    ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro", "gemini-flash"]
+                    + [m for m in discovered_models if "flash" in m.lower()]
+                    + discovered_models
+                )
+                seen = {clean_model}
+                unique_fallbacks = []
+                for m in fallback_pool:
+                    if m not in seen:
+                        seen.add(m)
+                        unique_fallbacks.append(m)
+
+                for candidate in unique_fallbacks:
+                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate}:generateContent"
                     fallback_resp = await client.post(fallback_url, headers=headers, params=params, json=payload)
                     if fallback_resp.status_code == 200:
                         resp = fallback_resp
-                        clean_model = discovered_model
+                        clean_model = candidate
+                        break
 
     except httpx.ConnectError:
         return ParseNoteResponse(
