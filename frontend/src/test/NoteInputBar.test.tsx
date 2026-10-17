@@ -25,9 +25,9 @@ describe('NoteInputBar component', () => {
   it('renders Google Gemini provider badge and title when active provider is gemini', async () => {
     vi.mocked(api.getAiStatus).mockResolvedValueOnce({
       provider: 'gemini',
-      model: 'gemini-1.5-flash',
+      model: 'gemini-2.5-flash',
       is_configured: true,
-      description: 'Google Gemini (gemini-1.5-flash) Hosted Cloud AI',
+      description: 'Google Gemini (gemini-2.5-flash) Hosted Cloud AI',
     });
 
     render(
@@ -41,7 +41,7 @@ describe('NoteInputBar component', () => {
     await waitFor(() => {
       expect(screen.getByText(/AI Note Parser \(Google Gemini\)/i)).toBeInTheDocument();
     });
-    expect(screen.getByText(/Cloud AI: gemini-1.5-flash/i)).toBeInTheDocument();
+    expect(screen.getByText(/Cloud AI: gemini-2.5-flash/i)).toBeInTheDocument();
     expect(screen.getByText(/Powered by Google Gemini API/i)).toBeInTheDocument();
   });
 

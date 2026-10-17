@@ -63,7 +63,7 @@ export const NoteInputBar: React.FC<NoteInputBarProps> = ({
   }, []);
 
   const isGemini = aiStatus?.provider === 'gemini';
-  const modelName = aiStatus?.model || (isGemini ? 'gemini-1.5-flash' : 'gemma3:1b');
+  const modelName = aiStatus?.model || (isGemini ? 'gemini-2.5-flash' : 'gemma3:1b');
 
   const handleExtract = async () => {
     if (!note.trim()) {

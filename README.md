@@ -49,7 +49,7 @@ Batchwise bridges this gap: **A local-first open-weight language model (Gemma 3 
 ┌──────────────────────────────┐   ┌──────────────────────────────┐
 │  Deterministic Math Engine   │   │     AI Note Extraction       │
 │   Python Decimal Arithmetic  │   │   • Google Gemini API (Cloud)│
-│   • Exact paisa precision    │   │     (gemini-1.5-flash / free)│
+│   • Exact paisa precision    │   │     (gemini-2.5-flash / free)│
 │   • Margin vs Markup logic   │   │   • Local Ollama (On-Device) │
 │   • Dimension-safe units     │   │     (gemma3:1b / private)    │
 │   • Step-by-step audit trace │   │   • Untrusted draft review   │
@@ -166,7 +166,7 @@ Batchwise is designed to be deployed cleanly on free cloud tiers with minimal co
 | `BATCHWISE_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated list of allowed frontend origins (e.g. `https://batchwise.vercel.app`) |
 | `BATCHWISE_AI_PROVIDER` | `auto` | AI extraction provider: `auto`, `gemini`, or `ollama`. In `auto` mode, uses Gemini if `GEMINI_API_KEY` is present, else Ollama. |
 | `GEMINI_API_KEY` | *(empty)* | Google Gemini API key (Free tier from [Google AI Studio](https://aistudio.google.com/)). Enables cloud AI parsing on hosted deploys like Render. |
-| `BATCHWISE_GEMINI_MODEL`| `gemini-1.5-flash` | Gemini model tag (e.g., `gemini-1.5-flash`, `gemini-2.0-flash`) |
+| `BATCHWISE_GEMINI_MODEL`| `gemini-2.5-flash` | Gemini model tag (e.g., `gemini-2.5-flash`, `gemini-2.0-flash`) |
 | `BATCHWISE_GEMINI_TIMEOUT`| `30.0` | Gemini API request timeout in seconds |
 | `BATCHWISE_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint (local-first on desktop/laptop) |
 | `BATCHWISE_OLLAMA_MODEL` | `gemma3:1b` | Ollama model tag |

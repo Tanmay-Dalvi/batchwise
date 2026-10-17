@@ -20,7 +20,7 @@ class Settings:
 
     # Google Gemini AI Configuration (Hosted Cloud Alternative)
     GEMINI_API_KEY: str = (os.getenv("GEMINI_API_KEY") or os.getenv("BATCHWISE_GEMINI_API_KEY") or "").strip()
-    GEMINI_MODEL: str = os.getenv("BATCHWISE_GEMINI_MODEL", "gemini-1.5-flash").strip()
+    GEMINI_MODEL: str = os.getenv("BATCHWISE_GEMINI_MODEL", "gemini-2.5-flash").strip()
     GEMINI_TIMEOUT_SECONDS: float = float(os.getenv("BATCHWISE_GEMINI_TIMEOUT", "30.0"))
 
     # AI Provider Resolution: "auto", "gemini", or "ollama"

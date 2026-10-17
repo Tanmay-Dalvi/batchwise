@@ -259,6 +259,56 @@ def _post_process_candidate(raw_dict: Dict[str, Any], raw_note: str) -> Candidat
     )
 
 
+async def _discover_available_gemini_model(
+    api_key: str,
+    client: httpx.AsyncClient,
+) -> Optional[str]:
+    """
+    Query Google Generative Language API ListModels endpoint to discover
+    an active, supported model for this API key if the default was retired or deprecated.
+    """
+    try:
+        resp = await client.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": api_key},
+            headers={"x-goog-api-key": api_key},
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        models = data.get("models", [])
+
+        candidates: List[str] = []
+        for m in models:
+            methods = m.get("supportedGenerationMethods", [])
+            if "generateContent" in methods:
+                name = m.get("name", "")
+                clean = name.removeprefix("models/").strip()
+                if clean:
+                    candidates.append(clean)
+
+        if not candidates:
+            return None
+
+        # Prioritize fast, free-tier friendly Flash models
+        flash_candidates = [c for c in candidates if "flash" in c.lower()]
+        for preferred in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"):
+            for fc in flash_candidates:
+                if fc == preferred:
+                    return fc
+        if flash_candidates:
+            return flash_candidates[0]
+
+        # Prioritize any Gemini model
+        gemini_candidates = [c for c in candidates if "gemini" in c.lower()]
+        if gemini_candidates:
+            return gemini_candidates[0]
+
+        return candidates[0]
+    except Exception:
+        return None
+
+
 async def _call_gemini_api(
     prompt: str,
     api_key: str,
@@ -271,14 +321,14 @@ async def _call_gemini_api(
 
     Guarantees:
     - Never leaks the API key in logs or error messages.
+    - Handles model deprecation (404) with automatic active model discovery.
     - Handles rate limits (429), auth failures (401/403), network timeouts, and model errors gracefully.
     - Routes the response into deterministic post-processing.
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
+    clean_model = model_name.strip()
+    if clean_model.startswith("models/"):
+        clean_model = clean_model[len("models/"):].strip()
+
     payload = {
         "contents": [
             {
@@ -293,9 +343,27 @@ async def _call_gemini_api(
         },
     }
 
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    params = {"key": api_key}
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, headers=headers, json=payload)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
+            resp = await client.post(url, headers=headers, params=params, json=payload)
+
+            # If 404 (e.g. deprecated model like gemini-1.5-flash), attempt automatic discovery
+            if resp.status_code == 404:
+                discovered_model = await _discover_available_gemini_model(api_key, client)
+                if discovered_model and discovered_model != clean_model:
+                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{discovered_model}:generateContent"
+                    fallback_resp = await client.post(fallback_url, headers=headers, params=params, json=payload)
+                    if fallback_resp.status_code == 200:
+                        resp = fallback_resp
+                        clean_model = discovered_model
+
     except httpx.ConnectError:
         return ParseNoteResponse(
             success=False,
@@ -304,7 +372,7 @@ async def _call_gemini_api(
                 "Unable to connect to Google Gemini API. Please check your internet connection. "
                 "Manual batch costing remains 100% available."
             ),
-            model_used=model_name,
+            model_used=clean_model,
             provider_used="gemini",
         )
     except httpx.TimeoutException:
@@ -312,10 +380,10 @@ async def _call_gemini_api(
             success=False,
             status="error",
             error_message=(
-                f"Google Gemini model '{model_name}' timed out after {timeout}s. "
+                f"Google Gemini model '{clean_model}' timed out after {timeout}s. "
                 "Manual recipe and batch costing is ready."
             ),
-            model_used=model_name,
+            model_used=clean_model,
             provider_used="gemini",
         )
     except httpx.HTTPError as e:
@@ -323,7 +391,7 @@ async def _call_gemini_api(
             success=False,
             status="error",
             error_message=f"Network error communicating with Google Gemini: {type(e).__name__}. Manual entry is available.",
-            model_used=model_name,
+            model_used=clean_model,
             provider_used="gemini",
         )
 
@@ -335,7 +403,7 @@ async def _call_gemini_api(
                 "Google Gemini API rate limit or quota exceeded (HTTP 429). "
                 "Please wait a moment and retry, or enter batch costs manually."
             ),
-            model_used=model_name,
+            model_used=clean_model,
             provider_used="gemini",
         )
 
@@ -348,16 +416,40 @@ async def _call_gemini_api(
                 "Please verify that your GEMINI_API_KEY is valid and has Gemini API enabled in Google AI Studio. "
                 "Manual batch costing is ready."
             ),
-            model_used=model_name,
+            model_used=clean_model,
+            provider_used="gemini",
+        )
+
+    if resp.status_code == 404:
+        google_detail = ""
+        try:
+            google_detail = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        detail_suffix = f": {google_detail}" if google_detail else ""
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=(
+                f"Google Gemini model '{clean_model}' was not found (HTTP 404){detail_suffix}. "
+                "Please set BATCHWISE_GEMINI_MODEL=gemini-2.5-flash in your environment. Manual costing is ready."
+            ),
+            model_used=clean_model,
             provider_used="gemini",
         )
 
     if resp.status_code != 200:
+        google_detail = ""
+        try:
+            google_detail = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        detail_suffix = f": {google_detail}" if google_detail else ""
         return ParseNoteResponse(
             success=False,
             status="error",
-            error_message=f"Google Gemini returned HTTP error {resp.status_code}. Manual costing is available.",
-            model_used=model_name,
+            error_message=f"Google Gemini returned HTTP error {resp.status_code}{detail_suffix}. Manual costing is available.",
+            model_used=clean_model,
             provider_used="gemini",
         )
 
@@ -369,7 +461,7 @@ async def _call_gemini_api(
                 success=False,
                 status="error",
                 error_message="Google Gemini returned no candidate content for this note. Manual costing is ready.",
-                model_used=model_name,
+                model_used=clean_model,
                 provider_used="gemini",
             )
         parts = candidates[0].get("content", {}).get("parts", [])
@@ -378,7 +470,7 @@ async def _call_gemini_api(
                 success=False,
                 status="error",
                 error_message="Google Gemini response contained empty content parts. Manual costing is ready.",
-                model_used=model_name,
+                model_used=clean_model,
                 provider_used="gemini",
             )
         raw_llm_text = parts[0]["text"]
@@ -387,7 +479,7 @@ async def _call_gemini_api(
             success=False,
             status="error",
             error_message="Google Gemini returned an unexpected response structure. Manual costing is ready.",
-            model_used=model_name,
+            model_used=clean_model,
             provider_used="gemini",
         )
 
@@ -397,7 +489,7 @@ async def _call_gemini_api(
             success=False,
             status="error",
             error_message="The model generated malformed output that could not be parsed into JSON. Manual costing is ready.",
-            model_used=model_name,
+            model_used=clean_model,
             provider_used="gemini",
         )
 
@@ -408,7 +500,7 @@ async def _call_gemini_api(
         success=True,
         status=status_str,
         candidate=candidate,
-        model_used=model_name,
+        model_used=clean_model,
         provider_used="gemini",
     )
 

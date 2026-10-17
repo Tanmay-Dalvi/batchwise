@@ -429,7 +429,7 @@ async def test_parse_note_gemini_success():
     assert result.success is True
     assert result.status == "success"
     assert result.provider_used == "gemini"
-    assert result.model_used == "gemini-1.5-flash"
+    assert result.model_used == "gemini-2.5-flash"
     assert result.candidate is not None
     assert result.candidate.batch_name == "Besan Batch"
     assert len(result.candidate.ingredients) == 2
@@ -582,13 +582,113 @@ def test_api_parse_note_status_endpoint(client, monkeypatch):
 
     monkeypatch.setattr(settings, "AI_PROVIDER", "gemini")
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "some-key")
-    monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-1.5-flash")
+    monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-2.5-flash")
 
     resp = client.get("/api/v1/parse-note/status")
     assert resp.status_code == status.HTTP_200_OK
     data = resp.json()
     assert data["provider"] == "gemini"
-    assert data["model"] == "gemini-1.5-flash"
+    assert data["model"] == "gemini-2.5-flash"
     assert data["is_configured"] is True
     assert "Google Gemini" in data["description"]
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_404_auto_discovery_fallback():
+    """Verify when configured model returns 404, parser discovers active model and succeeds."""
+    mock_llm_json = {
+        "batch_name": "Sourdough Batch",
+        "ingredients": [
+            {"name": "flour", "recipe_quantity": "2", "recipe_unit": "kg", "purchase_price": "140", "is_ambiguous": False}
+        ],
+        "sellable_quantity": "8",
+        "yield_unit_name": "loaves",
+        "planned_selling_price": "90",
+    }
+
+    # 1. 404 on deprecated gemini-1.5-flash
+    resp_404 = httpx.Response(
+        status_code=404,
+        json={"error": {"code": 404, "message": "models/gemini-1.5-flash is not found for API version v1beta"}},
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"),
+    )
+
+    # 2. ListModels response discovering gemini-2.5-flash
+    list_models_resp = httpx.Response(
+        status_code=200,
+        json={
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"],
+                }
+            ]
+        },
+        request=httpx.Request("GET", "https://generativelanguage.googleapis.com/v1beta/models"),
+    )
+
+    # 3. Success on discovered gemini-2.5-flash
+    resp_success = httpx.Response(
+        status_code=200,
+        json={
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": json.dumps(mock_llm_json)}],
+                    }
+                }
+            ]
+        },
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"),
+    )
+
+    with patch.object(httpx.AsyncClient, "get", new_callable=AsyncMock) as mock_get, \
+         patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_get.return_value = list_models_resp
+        mock_post.side_effect = [resp_404, resp_success]
+
+        result = await parse_costing_note(
+            "2 kg flour 140, baked 8 loaves, selling for 90 each",
+            provider="gemini",
+            api_key="valid-key",
+            model="gemini-1.5-flash",
+        )
+
+    assert result.success is True
+    assert result.status == "success"
+    assert result.model_used == "gemini-2.5-flash"  # Auto-migrated to discovered model
+    assert result.candidate is not None
+    assert result.candidate.batch_name == "Sourdough Batch"
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_404_no_fallback_gives_clear_guidance():
+    """Verify 404 when no fallback is found outputs clear guidance and Google's message."""
+    resp_404 = httpx.Response(
+        status_code=404,
+        json={"error": {"code": 404, "message": "Model not found"}},
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/unknown-model:generateContent"),
+    )
+    list_models_empty = httpx.Response(
+        status_code=200,
+        json={"models": []},
+        request=httpx.Request("GET", "https://generativelanguage.googleapis.com/v1beta/models"),
+    )
+
+    with patch.object(httpx.AsyncClient, "get", new_callable=AsyncMock) as mock_get, \
+         patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_get.return_value = list_models_empty
+        mock_post.return_value = resp_404
+
+        result = await parse_costing_note(
+            "2 kg flour 140",
+            provider="gemini",
+            api_key="valid-key",
+            model="unknown-model",
+        )
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "HTTP 404" in result.error_message
+    assert "BATCHWISE_GEMINI_MODEL=gemini-2.5-flash" in result.error_message
 
