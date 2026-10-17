@@ -384,3 +384,211 @@ def test_clean_number_string_nan_edge():
     assert _clean_number_string(".") is None
     assert _clean_number_string("..") is None
 
+
+# --- Google Gemini AI Unit Tests (Mocked) ---
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_success():
+    """Verify successful parsing with Google Gemini API using mock REST response."""
+    mock_llm_json = {
+        "batch_name": "Besan Batch",
+        "ingredients": [
+            {"name": "besan", "recipe_quantity": "5", "recipe_unit": "kg", "purchase_price": "600", "is_ambiguous": False},
+            {"name": "oil", "recipe_quantity": "1", "recipe_unit": "l", "purchase_price": "180", "is_ambiguous": False},
+        ],
+        "packaging_cost": "80",
+        "sellable_quantity": "75",
+        "yield_unit_name": "packets",
+        "planned_selling_price": "25",
+    }
+    gemini_resp_payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{"text": json.dumps(mock_llm_json)}],
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+    mock_resp = httpx.Response(
+        status_code=200,
+        json=gemini_resp_payload,
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note(
+            "5 kg besan cost 600 rupees, 1 l oil 180, packaging 80, made 75 packets, selling price 25 each.",
+            provider="gemini",
+            api_key="test-api-key-12345",
+        )
+
+    assert result.success is True
+    assert result.status == "success"
+    assert result.provider_used == "gemini"
+    assert result.model_used == "gemini-1.5-flash"
+    assert result.candidate is not None
+    assert result.candidate.batch_name == "Besan Batch"
+    assert len(result.candidate.ingredients) == 2
+    assert result.candidate.can_calculate is True
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_rate_limit_429():
+    """Verify Gemini HTTP 429 rate limit is handled gracefully with clear guidance."""
+    mock_resp = httpx.Response(
+        status_code=429,
+        json={"error": {"code": 429, "message": "Resource has been exhausted (e.g. check quota)."}},
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note(
+            "5 kg besan 600",
+            provider="gemini",
+            api_key="test-api-key-12345",
+        )
+
+    assert result.success is False
+    assert result.status == "error"
+    assert result.provider_used == "gemini"
+    assert "rate limit or quota exceeded" in result.error_message.lower()
+    assert "manual" in result.error_message.lower()
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_auth_failure_403():
+    """Verify Gemini invalid API key (403/401) is handled with clear instructions."""
+    mock_resp = httpx.Response(
+        status_code=403,
+        json={"error": {"code": 403, "message": "API key not valid. Please pass a valid API key."}},
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note(
+            "5 kg besan 600",
+            provider="gemini",
+            api_key="invalid-key",
+        )
+
+    assert result.success is False
+    assert result.status == "error"
+    assert result.provider_used == "gemini"
+    assert "authorization failed" in result.error_message.lower()
+    assert "GEMINI_API_KEY" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_timeout():
+    """Verify Gemini request timeout returns clean error without crashing."""
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = httpx.TimeoutException("Read timed out")
+        result = await parse_costing_note(
+            "5 kg besan 600",
+            provider="gemini",
+            api_key="test-api-key",
+            timeout_seconds=5.0,
+        )
+
+    assert result.success is False
+    assert result.status == "error"
+    assert result.provider_used == "gemini"
+    assert "timed out after 5.0s" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_connect_error():
+    """Verify network connection error to Gemini API is handled gracefully."""
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = httpx.ConnectError("Failed to resolve host")
+        result = await parse_costing_note(
+            "5 kg besan 600",
+            provider="gemini",
+            api_key="test-api-key",
+        )
+
+    assert result.success is False
+    assert result.status == "error"
+    assert result.provider_used == "gemini"
+    assert "Unable to connect to Google Gemini API" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_missing_key():
+    """Requesting Gemini provider without an API key returns clean guidance."""
+    result = await parse_costing_note(
+        "5 kg besan 600",
+        provider="gemini",
+        api_key="",  # Empty key
+    )
+    assert result.success is False
+    assert result.status == "error"
+    assert "GEMINI_API_KEY" in result.error_message
+
+
+@pytest.mark.anyio
+async def test_parse_note_gemini_empty_parts():
+    """Gemini response with empty parts returns safe error."""
+    mock_resp = httpx.Response(
+        status_code=200,
+        json={"candidates": [{"content": {"parts": []}}]},
+        request=httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"),
+    )
+
+    with patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        result = await parse_costing_note(
+            "5 kg besan 600",
+            provider="gemini",
+            api_key="test-api-key",
+        )
+
+    assert result.success is False
+    assert result.status == "error"
+    assert "empty content parts" in result.error_message
+
+
+def test_effective_ai_provider_resolution(monkeypatch):
+    """Verify Settings.get_effective_ai_provider behavior."""
+    from app.config import settings
+
+    # Explicit gemini
+    monkeypatch.setattr(settings, "AI_PROVIDER", "gemini")
+    assert settings.get_effective_ai_provider() == "gemini"
+
+    # Explicit ollama
+    monkeypatch.setattr(settings, "AI_PROVIDER", "ollama")
+    assert settings.get_effective_ai_provider() == "ollama"
+
+    # Auto mode with key
+    monkeypatch.setattr(settings, "AI_PROVIDER", "auto")
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", "dummy-key")
+    assert settings.get_effective_ai_provider() == "gemini"
+
+    # Auto mode without key
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", "")
+    assert settings.get_effective_ai_provider() == "ollama"
+
+
+def test_api_parse_note_status_endpoint(client, monkeypatch):
+    """GET /api/v1/parse-note/status returns active provider details."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "AI_PROVIDER", "gemini")
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", "some-key")
+    monkeypatch.setattr(settings, "GEMINI_MODEL", "gemini-1.5-flash")
+
+    resp = client.get("/api/v1/parse-note/status")
+    assert resp.status_code == status.HTTP_200_OK
+    data = resp.json()
+    assert data["provider"] == "gemini"
+    assert data["model"] == "gemini-1.5-flash"
+    assert data["is_configured"] is True
+    assert "Google Gemini" in data["description"]
+

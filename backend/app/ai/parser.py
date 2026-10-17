@@ -1,4 +1,4 @@
-"""AI extraction service connecting to local Ollama (Gemma 3 1B) with deterministic post-processing."""
+"""AI extraction service connecting to local Ollama (Gemma 3 1B) or hosted Google Gemini with deterministic post-processing."""
 
 import json
 import re
@@ -259,38 +259,175 @@ def _post_process_candidate(raw_dict: Dict[str, Any], raw_note: str) -> Candidat
     )
 
 
-async def parse_costing_note(
-    note: str,
-    ollama_url: Optional[str] = None,
-    model: Optional[str] = None,
-    timeout_seconds: Optional[float] = None,
+async def _call_gemini_api(
+    prompt: str,
+    api_key: str,
+    model_name: str,
+    timeout: float,
+    cleaned_note: str,
 ) -> ParseNoteResponse:
     """
-    Parse a natural-language costing note into a structured candidate batch extraction.
-    
+    Call Google Gemini generateContent REST API with structured JSON output mode.
+
     Guarantees:
-    - Never crashes on timeouts, connection failures, or malformed LLM responses
-    - Strictly delegates all calculations to the deterministic financial engine
-    - Reports ambiguities explicitly rather than fabricating data
+    - Never leaks the API key in logs or error messages.
+    - Handles rate limits (429), auth failures (401/403), network timeouts, and model errors gracefully.
+    - Routes the response into deterministic post-processing.
     """
-    cleaned_note = note.strip()
-    if not cleaned_note:
-        return ParseNoteResponse(
-            success=False,
-            status="error",
-            error_message="Empty note provided. Please enter recipe ingredients, expenses, or yield.",
-        )
-
-    base_url = (ollama_url or settings.OLLAMA_BASE_URL).rstrip("/")
-    model_name = model or settings.OLLAMA_MODEL
-    timeout = timeout_seconds or settings.OLLAMA_TIMEOUT_SECONDS
-
-    prompt = build_extraction_prompt(cleaned_note)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except httpx.ConnectError:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=(
+                "Unable to connect to Google Gemini API. Please check your internet connection. "
+                "Manual batch costing remains 100% available."
+            ),
+            model_used=model_name,
+            provider_used="gemini",
+        )
+    except httpx.TimeoutException:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=(
+                f"Google Gemini model '{model_name}' timed out after {timeout}s. "
+                "Manual recipe and batch costing is ready."
+            ),
+            model_used=model_name,
+            provider_used="gemini",
+        )
+    except httpx.HTTPError as e:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=f"Network error communicating with Google Gemini: {type(e).__name__}. Manual entry is available.",
+            model_used=model_name,
+            provider_used="gemini",
+        )
+
+    if resp.status_code == 429:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=(
+                "Google Gemini API rate limit or quota exceeded (HTTP 429). "
+                "Please wait a moment and retry, or enter batch costs manually."
+            ),
+            model_used=model_name,
+            provider_used="gemini",
+        )
+
+    if resp.status_code in (401, 403):
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=(
+                "Google Gemini API authorization failed (HTTP 403/401). "
+                "Please verify that your GEMINI_API_KEY is valid and has Gemini API enabled in Google AI Studio. "
+                "Manual batch costing is ready."
+            ),
+            model_used=model_name,
+            provider_used="gemini",
+        )
+
+    if resp.status_code != 200:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message=f"Google Gemini returned HTTP error {resp.status_code}. Manual costing is available.",
+            model_used=model_name,
+            provider_used="gemini",
+        )
+
+    try:
+        response_body = resp.json()
+        candidates = response_body.get("candidates", [])
+        if not candidates:
+            return ParseNoteResponse(
+                success=False,
+                status="error",
+                error_message="Google Gemini returned no candidate content for this note. Manual costing is ready.",
+                model_used=model_name,
+                provider_used="gemini",
+            )
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts or not parts[0].get("text"):
+            return ParseNoteResponse(
+                success=False,
+                status="error",
+                error_message="Google Gemini response contained empty content parts. Manual costing is ready.",
+                model_used=model_name,
+                provider_used="gemini",
+            )
+        raw_llm_text = parts[0]["text"]
+    except Exception:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message="Google Gemini returned an unexpected response structure. Manual costing is ready.",
+            model_used=model_name,
+            provider_used="gemini",
+        )
+
+    raw_dict = _extract_json_payload(raw_llm_text)
+    if raw_dict is None:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message="The model generated malformed output that could not be parsed into JSON. Manual costing is ready.",
+            model_used=model_name,
+            provider_used="gemini",
+        )
+
+    candidate = _post_process_candidate(raw_dict, cleaned_note)
+    status_str = "success" if candidate.can_calculate else "partial"
+
+    return ParseNoteResponse(
+        success=True,
+        status=status_str,
+        candidate=candidate,
+        model_used=model_name,
+        provider_used="gemini",
+    )
+
+
+async def _call_ollama_api(
+    prompt: str,
+    base_url: str,
+    model_name: str,
+    timeout: float,
+    cleaned_note: str,
+) -> ParseNoteResponse:
+    """
+    Call local Ollama /api/generate endpoint with JSON mode.
+    """
+    clean_url = f"{base_url.rstrip('/')}/api/generate"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
-                f"{base_url}/api/generate",
+                clean_url,
                 json={
                     "model": model_name,
                     "prompt": prompt,
@@ -307,6 +444,7 @@ async def parse_costing_note(
                 "Ensure Ollama is running (`ollama serve`). Manual batch costing remains fully available."
             ),
             model_used=model_name,
+            provider_used="ollama",
         )
     except httpx.TimeoutException:
         return ParseNoteResponse(
@@ -317,6 +455,7 @@ async def parse_costing_note(
                 "Manual recipe and batch costing is ready."
             ),
             model_used=model_name,
+            provider_used="ollama",
         )
     except httpx.HTTPError as e:
         return ParseNoteResponse(
@@ -324,6 +463,7 @@ async def parse_costing_note(
             status="error",
             error_message=f"HTTP communication error with Ollama: {str(e)}. Manual entry is available.",
             model_used=model_name,
+            provider_used="ollama",
         )
 
     if resp.status_code != 200:
@@ -332,6 +472,7 @@ async def parse_costing_note(
             status="error",
             error_message=f"Ollama returned HTTP error {resp.status_code}: {resp.text}. Manual costing is available.",
             model_used=model_name,
+            provider_used="ollama",
         )
 
     try:
@@ -343,6 +484,7 @@ async def parse_costing_note(
             status="error",
             error_message="Ollama returned an unexpected non-JSON response payload.",
             model_used=model_name,
+            provider_used="ollama",
         )
 
     raw_dict = _extract_json_payload(raw_llm_text)
@@ -352,6 +494,7 @@ async def parse_costing_note(
             status="error",
             error_message="The model generated malformed output that could not be parsed into JSON. Manual costing is ready.",
             model_used=model_name,
+            provider_used="ollama",
         )
 
     candidate = _post_process_candidate(raw_dict, cleaned_note)
@@ -362,4 +505,101 @@ async def parse_costing_note(
         status=status_str,
         candidate=candidate,
         model_used=model_name,
+        provider_used="ollama",
     )
+
+
+async def parse_costing_note(
+    note: str,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+    ollama_url: Optional[str] = None,
+) -> ParseNoteResponse:
+    """
+    Parse a natural-language costing note into a structured candidate batch extraction.
+
+    Supports:
+    - Hosted Google Gemini API (gemini-1.5-flash / gemini-2.0-flash)
+    - Local Ollama (Gemma 3 1B)
+    - Automatic provider fallback (uses Gemini if API key configured, otherwise Ollama)
+
+    Guarantees:
+    - Never crashes on timeouts, connection failures, or malformed LLM responses
+    - Strictly delegates all calculations to the deterministic financial engine
+    - Reports ambiguities explicitly rather than fabricating data
+    """
+    cleaned_note = note.strip()
+    if not cleaned_note:
+        return ParseNoteResponse(
+            success=False,
+            status="error",
+            error_message="Empty note provided. Please enter recipe ingredients, expenses, or yield.",
+        )
+
+    active_provider = (provider or settings.get_effective_ai_provider()).lower().strip()
+    prompt = build_extraction_prompt(cleaned_note)
+
+    if active_provider == "gemini":
+        gemini_key = (api_key or settings.GEMINI_API_KEY).strip()
+        model_name = model or settings.GEMINI_MODEL
+        timeout = timeout_seconds or settings.GEMINI_TIMEOUT_SECONDS
+
+        if not gemini_key:
+            return ParseNoteResponse(
+                success=False,
+                status="error",
+                error_message=(
+                    "Google Gemini API key is not configured. "
+                    "Set GEMINI_API_KEY environment variable in your deployment settings, "
+                    "or configure BATCHWISE_AI_PROVIDER=ollama for local AI. Manual costing is always ready."
+                ),
+                model_used=model_name,
+                provider_used="gemini",
+            )
+
+        return await _call_gemini_api(
+            prompt=prompt,
+            api_key=gemini_key,
+            model_name=model_name,
+            timeout=timeout,
+            cleaned_note=cleaned_note,
+        )
+
+    # Local Ollama fallback
+    base_url = ollama_url or settings.OLLAMA_BASE_URL
+    model_name = model or settings.OLLAMA_MODEL
+    timeout = timeout_seconds or settings.OLLAMA_TIMEOUT_SECONDS
+
+    return await _call_ollama_api(
+        prompt=prompt,
+        base_url=base_url,
+        model_name=model_name,
+        timeout=timeout,
+        cleaned_note=cleaned_note,
+    )
+
+
+def get_ai_service_status() -> Dict[str, Any]:
+    """Retrieve operational status and provider details for the AI note parser."""
+    provider = settings.get_effective_ai_provider()
+    if provider == "gemini":
+        is_configured = bool(settings.GEMINI_API_KEY)
+        return {
+            "provider": "gemini",
+            "model": settings.GEMINI_MODEL,
+            "is_configured": is_configured,
+            "description": (
+                f"Google Gemini ({settings.GEMINI_MODEL}) Hosted Cloud AI"
+                if is_configured
+                else f"Google Gemini ({settings.GEMINI_MODEL}) - API key not set"
+            ),
+        }
+    else:
+        return {
+            "provider": "ollama",
+            "model": settings.OLLAMA_MODEL,
+            "is_configured": True,
+            "description": f"Gemma 3 ({settings.OLLAMA_MODEL}) on Local Ollama (Private)",
+        }

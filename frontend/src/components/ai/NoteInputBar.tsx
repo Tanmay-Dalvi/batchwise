@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { api, ApiError } from '../../lib/api';
-import { ParseNoteResponse } from '../../types/ai';
+import { AiStatusResponse, ParseNoteResponse } from '../../types/ai';
 import { Button } from '../common/Button';
 import {
   Sparkles,
@@ -8,6 +8,8 @@ import {
   AlertCircle,
   FileText,
   CornerDownLeft,
+  Cloud,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface NoteInputBarProps {
@@ -42,6 +44,26 @@ export const NoteInputBar: React.FC<NoteInputBarProps> = ({
 }) => {
   const [note, setNote] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiStatusResponse | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    api.getAiStatus()
+      .then((status) => {
+        if (isMounted) {
+          setAiStatus(status);
+        }
+      })
+      .catch(() => {
+        // Silently keep default fallback
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const isGemini = aiStatus?.provider === 'gemini';
+  const modelName = aiStatus?.model || (isGemini ? 'gemini-1.5-flash' : 'gemma3:1b');
 
   const handleExtract = async () => {
     if (!note.trim()) {
@@ -59,14 +81,18 @@ export const NoteInputBar: React.FC<NoteInputBarProps> = ({
       } else {
         setError(
           response.error_message ||
-            'AI parser could not structure the note. Please check Ollama or refine your text.'
+            'AI parser could not structure the note. Please check your AI configuration or refine your text.'
         );
       }
     } catch (err: any) {
       if (err instanceof ApiError) {
         setError(err.message);
       } else {
-        setError('Failed to reach local Ollama AI parser. Ensure Ollama is running.');
+        setError(
+          isGemini
+            ? 'Failed to reach AI parser service. Please check your backend connection or enter costs manually.'
+            : 'Failed to reach local Ollama AI parser. Ensure Ollama is running or enter costs manually.'
+        );
       }
     } finally {
       setIsExtracting(false);
@@ -82,18 +108,27 @@ export const NoteInputBar: React.FC<NoteInputBarProps> = ({
           </div>
           <div>
             <h3 className="text-base font-semibold text-stone-900">
-              AI Note Parser (Gemma 3 1B)
+              {isGemini ? 'AI Note Parser (Google Gemini)' : 'AI Note Parser (Gemma 3 1B)'}
             </h3>
             <p className="text-xs text-stone-500">
-              Speak or paste raw purchase notes. Local AI structures it; the math engine does the rest.
+              {isGemini
+                ? 'Paste messy purchase notes. Cloud AI extracts candidate fields; pure Python Decimal calculates financial costs.'
+                : 'Speak or paste raw purchase notes. Local AI structures it; the math engine does the rest.'}
             </p>
           </div>
         </div>
 
-        <div className="text-[11px] font-medium bg-lime-100 text-forest-900 px-2.5 py-1 rounded-full flex items-center gap-1">
-          <Sparkles className="w-3.5 h-3.5 text-forest-700" />
-          <span>Local & Private</span>
-        </div>
+        {isGemini ? (
+          <div className="text-[11px] font-medium bg-emerald-50 text-emerald-900 border border-emerald-200 px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-xs">
+            <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+            <span>Cloud AI: {modelName}</span>
+          </div>
+        ) : (
+          <div className="text-[11px] font-medium bg-lime-100 text-forest-900 px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-xs">
+            <ShieldCheck className="w-3.5 h-3.5 text-forest-700" />
+            <span>Local & Private (Ollama)</span>
+          </div>
+        )}
       </div>
 
       {/* Sample Note Chips */}
@@ -137,7 +172,9 @@ export const NoteInputBar: React.FC<NoteInputBarProps> = ({
       {/* Action footer */}
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 pt-1">
         <span className="text-[11px] text-stone-500">
-          Powered by local Gemma 3 1B on Ollama. On hosted cloud demos without local Ollama access, manual batch costing remains 100% functional.
+          {isGemini
+            ? 'Powered by Google Gemini API (hosted cloud AI). Notes are sent to Gemini for staging extraction only. Financial arithmetic is strictly calculated by Batchwise. Manual batch costing is 100% available without AI.'
+            : 'Powered by local Gemma 3 1B on Ollama. Private on-device extraction. On hosted cloud demos without local Ollama access, manual batch costing remains 100% functional.'}
         </span>
 
         <Button
@@ -148,7 +185,7 @@ export const NoteInputBar: React.FC<NoteInputBarProps> = ({
           className="w-full sm:w-auto bg-forest-900 hover:bg-forest-950 text-white font-medium"
         >
           {isExtracting ? (
-            'Parsing with Gemma 3...'
+            isGemini ? 'Parsing with Gemini...' : 'Parsing with Gemma 3...'
           ) : (
             <>
               <Sparkles className="w-4 h-4 mr-1.5 text-lime-400" />

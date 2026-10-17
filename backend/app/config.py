@@ -18,6 +18,32 @@ class Settings:
     OLLAMA_MODEL: str = os.getenv("BATCHWISE_OLLAMA_MODEL", "gemma3:1b")
     OLLAMA_TIMEOUT_SECONDS: float = float(os.getenv("BATCHWISE_OLLAMA_TIMEOUT", "30.0"))
 
+    # Google Gemini AI Configuration (Hosted Cloud Alternative)
+    GEMINI_API_KEY: str = (os.getenv("GEMINI_API_KEY") or os.getenv("BATCHWISE_GEMINI_API_KEY") or "").strip()
+    GEMINI_MODEL: str = os.getenv("BATCHWISE_GEMINI_MODEL", "gemini-1.5-flash").strip()
+    GEMINI_TIMEOUT_SECONDS: float = float(os.getenv("BATCHWISE_GEMINI_TIMEOUT", "30.0"))
+
+    # AI Provider Resolution: "auto", "gemini", or "ollama"
+    AI_PROVIDER: str = os.getenv("BATCHWISE_AI_PROVIDER", "auto").lower().strip()
+
+    def get_effective_ai_provider(self) -> str:
+        """
+        Resolve the active AI provider based on configuration.
+        
+        - "gemini": Strictly use Google Gemini API.
+        - "ollama": Strictly use local Ollama instance.
+        - "auto": Prefer Google Gemini if GEMINI_API_KEY is configured, else fallback to Ollama.
+        """
+        provider = self.AI_PROVIDER
+        if provider == "gemini":
+            return "gemini"
+        if provider == "ollama":
+            return "ollama"
+        # "auto"
+        if bool(self.GEMINI_API_KEY):
+            return "gemini"
+        return "ollama"
+
     # CORS allowed origins (supports comma-separated env var for deployment)
     CORS_ORIGINS: List[str] = (
         [o.strip() for o in os.getenv("BATCHWISE_CORS_ORIGINS").split(",") if o.strip()]

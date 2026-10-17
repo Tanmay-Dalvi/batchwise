@@ -61,4 +61,13 @@ class ParseNoteResponse(BaseModel):
     candidate: Optional[CandidateBatchExtraction] = None
     error_message: Optional[str] = None
     model_used: Optional[str] = None
+    provider_used: Optional[str] = Field(default=None, description="'gemini' or 'ollama'")
+
+
+class AiStatusResponse(BaseModel):
+    """Operational status and active provider configuration for AI note extraction."""
+    provider: str = Field(..., description="'gemini' or 'ollama'")
+    model: str = Field(..., description="Active model name")
+    is_configured: bool = Field(..., description="True if provider is ready to process requests")
+    description: str = Field(..., description="Human-friendly provider status description")
 

@@ -44,5 +44,13 @@ export interface ParseNoteResponse {
   candidate?: CandidateBatchExtraction | null;
   error_message?: string | null;
   model_used?: string | null;
+  provider_used?: 'gemini' | 'ollama' | string | null;
+}
+
+export interface AiStatusResponse {
+  provider: 'gemini' | 'ollama';
+  model: string;
+  is_configured: boolean;
+  description: string;
 }
 

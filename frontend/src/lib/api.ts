@@ -5,7 +5,7 @@ import {
   BatchRecordDetailResponse,
   BatchRecordSummary,
 } from '../types/costing';
-import { ParseNoteResponse } from '../types/ai';
+import { AiStatusResponse, ParseNoteResponse } from '../types/ai';
 import {
   RecipeCreate,
   RecipeResponse,
@@ -101,6 +101,10 @@ export const api = {
   },
 
   // AI Note Parser
+  async getAiStatus(): Promise<AiStatusResponse> {
+    return request('/parse-note/status');
+  },
+
   async parseNote(note: string): Promise<ParseNoteResponse> {
     return request('/parse-note', {
       method: 'POST',

@@ -42,17 +42,18 @@ Batchwise bridges this gap: **A local-first open-weight language model (Gemma 3 
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                       FastAPI Backend                           │
-│        Endpoints: /calculate, /recipes, /batches, /health       │
+│        Endpoints: /calculate, /recipes, /batches, /parse-note   │
 └──────────────┬──────────────────────────────────┬───────────────┘
                │                                  │
                ▼                                  ▼
 ┌──────────────────────────────┐   ┌──────────────────────────────┐
-│  Deterministic Math Engine   │   │   Local Ollama AI Parser     │
-│   Python Decimal Arithmetic  │   │        (gemma3:1b)           │
-│   • Exact paisa precision    │   │   • Unstructured note parser │
-│   • Margin vs Markup logic   │   │   • Ambiguity flagger        │
-│   • Dimension-safe units     │   │   • Draft staging review     │
-│   • Step-by-step audit trace │   │   • Zero LLM math allowed    │
+│  Deterministic Math Engine   │   │     AI Note Extraction       │
+│   Python Decimal Arithmetic  │   │   • Google Gemini API (Cloud)│
+│   • Exact paisa precision    │   │     (gemini-1.5-flash / free)│
+│   • Margin vs Markup logic   │   │   • Local Ollama (On-Device) │
+│   • Dimension-safe units     │   │     (gemma3:1b / private)    │
+│   • Step-by-step audit trace │   │   • Untrusted draft review   │
+│   • Zero LLM math allowed    │   │   • Zero arithmetic by AI    │
 └──────────────┬───────────────┘   └──────────────────────────────┘
                │
                ▼
@@ -66,9 +67,10 @@ Batchwise bridges this gap: **A local-first open-weight language model (Gemma 3 
 
 ### Guarantees
 - **Zero Binary Float Arithmetic:** All currency and quantity calculations use Python `decimal.Decimal` with standard `ROUND_HALF_UP`.
-- **Zero AI Math:** The language model *never* calculates totals, unit costs, profit, or margins. All arithmetic is executed deterministically by verified Python algorithms.
+- **Zero AI Math:** The language model (whether hosted Gemini or local Gemma 3) *never* calculates totals, unit costs, profit, or margins. All arithmetic is executed deterministically by verified Python algorithms.
 - **Strict Dimension Safety:** Mass (kg/g), Volume (L/ml), and Count (units/dozens) conversions are dimension-checked. Cross-dimensional conversions (e.g. kg to L) are rejected unless an explicit conversion is provided.
-- **Human-in-the-Loop AI Staging:** AI extractions are presented in an editable review staging modal. Ambiguities are highlighted in amber alerts, and values are never committed without confirmation.
+- **Human-in-the-Loop AI Staging:** AI extractions are presented in an editable review staging modal. Ambiguities are highlighted in amber alerts, and values are never committed without seller review and confirmation.
+- **Flexible Deployment:** Supports private local-first workflows (via Ollama) and turnkey hosted cloud demos (via Google Gemini free tier), with automatic provider resolution.
 
 ---
 
@@ -162,9 +164,13 @@ Batchwise is designed to be deployed cleanly on free cloud tiers with minimal co
 | `HOST` | `0.0.0.0` | Bind address for container/server |
 | `BATCHWISE_DATABASE_URL` | `sqlite:///./batchwise.db` | Database connection string (SQLite or PostgreSQL) |
 | `BATCHWISE_CORS_ORIGINS` | `http://localhost:5173` | Comma-separated list of allowed frontend origins (e.g. `https://batchwise.vercel.app`) |
-| `BATCHWISE_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint (local-first) |
+| `BATCHWISE_AI_PROVIDER` | `auto` | AI extraction provider: `auto`, `gemini`, or `ollama`. In `auto` mode, uses Gemini if `GEMINI_API_KEY` is present, else Ollama. |
+| `GEMINI_API_KEY` | *(empty)* | Google Gemini API key (Free tier from [Google AI Studio](https://aistudio.google.com/)). Enables cloud AI parsing on hosted deploys like Render. |
+| `BATCHWISE_GEMINI_MODEL`| `gemini-1.5-flash` | Gemini model tag (e.g., `gemini-1.5-flash`, `gemini-2.0-flash`) |
+| `BATCHWISE_GEMINI_TIMEOUT`| `30.0` | Gemini API request timeout in seconds |
+| `BATCHWISE_OLLAMA_URL` | `http://localhost:11434` | Ollama API endpoint (local-first on desktop/laptop) |
 | `BATCHWISE_OLLAMA_MODEL` | `gemma3:1b` | Ollama model tag |
-| `BATCHWISE_OLLAMA_TIMEOUT`| `30.0` | Request timeout in seconds |
+| `BATCHWISE_OLLAMA_TIMEOUT`| `30.0` | Ollama request timeout in seconds |
 
 #### Frontend (`frontend/.env.example`)
 | Variable | Default | Purpose |
@@ -173,14 +179,16 @@ Batchwise is designed to be deployed cleanly on free cloud tiers with minimal co
 
 ---
 
-## 7. Important Hosted Limitations & Honest Disclosure
+## 7. AI Providers & Honest Hosting Disclosure
 
-1. **Local-First AI vs. Cloud Hosting:**
-   - The AI Note Parser is designed as an open-weight, **local-first** feature powered by `gemma3:1b` on Ollama to guarantee seller privacy.
-   - A remote, cloud-hosted backend (e.g., Render Free tier) **cannot** access an Ollama daemon running on a user's personal laptop (`localhost:11434`).
-   - On a hosted public demo without a local Ollama connection, the UI clearly displays this limitation: **Manual batch costing, recipe management, break-even simulation, and history tracking remain 100% operational.**
+1. **Dual AI Provider Architecture (Cloud + Local):**
+   - **Hosted Cloud AI (Google Gemini):** On hosted deployments like Render, configure `GEMINI_API_KEY` in Render environment variables. Batchwise calls Gemini's free tier via backend REST proxy with native JSON output mode. No personal notes are stored by the model, and LLM arithmetic is forbidden.
+   - **Local & Private (Ollama Gemma 3 1B):** When self-hosting on a personal laptop or local server with Ollama running (`ollama run gemma3:1b`), Batchwise keeps all note processing 100% on-device and offline.
+   - **Graceful Degradation:** If neither Gemini nor Ollama is configured or reachable, the application informs the user clearly: **Manual batch costing, recipe management, break-even simulation, and production batch history remain 100% operational.**
 2. **SQLite Storage on Ephemeral Free Hosting:**
    - On free hosting tiers without persistent volume support (such as Render's Free Web Service), local SQLite files reset whenever the free container spins down after inactivity.
+   - For a production deployment requiring permanent cloud storage, configure `BATCHWISE_DATABASE_URL` with a PostgreSQL connection string (such as Neon or Supabase free tiers).
+   - For local self-hosting on a baker's laptop, the default SQLite storage is permanently persisted to disk.
    - For a production deployment requiring permanent cloud storage, configure `BATCHWISE_DATABASE_URL` with a PostgreSQL connection string (such as Neon or Supabase free tiers).
    - For local self-hosting on a baker's laptop, the default SQLite storage is permanently persisted to disk.
 

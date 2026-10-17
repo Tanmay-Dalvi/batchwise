@@ -139,7 +139,7 @@ export const App: React.FC = () => {
               </h2>
               <p className="text-xs sm:text-sm text-stone-500 mt-1">
                 Type or paste vendor purchase notes in Hindi-English or plain conversational English.
-                Gemma 3 1B structures ingredients and prices; pure arithmetic determines profitability.
+                AI structures ingredients and prices; pure Python Decimal arithmetic determines profitability.
               </p>
             </div>
 
